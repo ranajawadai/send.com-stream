@@ -1,8 +1,8 @@
-FROM node:20-slim
+FROM node:20
 
-# Install unrar and wget for RAR extraction and downloads
+# Install p7zip-full (handles RAR) and wget
 RUN apt-get update && \
-    apt-get install -y unrar wget && \
+    apt-get install -y p7zip-full wget && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

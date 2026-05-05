@@ -178,25 +178,15 @@ function extractRar(filePath, extractDir, downloadId) {
         console.log('Extracting:', filePath);
 
         try {
-            // Use unrar to extract
-            execSync('unrar x -o+ -y "' + filePath + '" "' + extractDir + '/"', {
-                timeout: 600000, // 10 minutes
+            // Use 7z to extract (supports RAR, ZIP, 7z)
+            execSync('7z x -y -o"' + extractDir + '" "' + filePath + '"', {
+                timeout: 600000,
                 stdio: 'pipe'
             });
             console.log('Extraction completed:', extractDir);
             resolve();
         } catch (err) {
-            // Try with 7z as fallback
-            try {
-                execSync('7z x -y -o"' + extractDir + '" "' + filePath + '"', {
-                    timeout: 600000,
-                    stdio: 'pipe'
-                });
-                console.log('Extraction completed with 7z:', extractDir);
-                resolve();
-            } catch (err2) {
-                reject(new Error('Extraction failed: ' + err.message));
-            }
+            reject(new Error('Extraction failed: ' + err.message));
         }
     });
 }
