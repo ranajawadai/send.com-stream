@@ -413,6 +413,140 @@ function extractDownloadLink(html) {
     return null;
 }
 
+// ===== BROWSER RELAY — Browser downloads, server extracts =====
+
+var relaySessions = {};
+
+// Start a relay session
+app.post('/relay-start', function (req, res) {
+    var fileName = req.body.fileName || 'upload.rar';
+    var totalSize = req.body.totalSize || 0;
+    var relayId = 'relay_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+    var filePath = path.join(DOWNLOADS_DIR, relayId + '_' + fileName);
+    var extractDir = path.join(EXTRACTED_DIR, relayId);
+
+    fs.mkdirSync(extractDir, { recursive: true });
+
+    relaySessions[relayId] = {
+        id: relayId,
+        fileName: fileName,
+        totalSize: totalSize,
+        receivedBytes: 0,
+        filePath: filePath,
+        extractDir: extractDir,
+        status: 'receiving',
+        files: [],
+        startTime: Date.now(),
+        writeStream: fs.createWriteStream(filePath)
+    };
+
+    activeDownloads[relayId] = {
+        id: relayId,
+        status: 'receiving',
+        fileName: fileName,
+        progress: 0,
+        downloadedBytes: 0,
+        totalBytes: totalSize,
+        speed: 0,
+        eta: null,
+        files: [],
+        error: null,
+        startTime: Date.now()
+    };
+
+    console.log('Relay session started:', relayId, fileName);
+    res.json({ relayId: relayId, status: 'receiving' });
+});
+
+// Upload a chunk (binary body)
+app.post('/relay-chunk/:id', express.raw({ limit: '50mb', type: '*/*' }), function (req, res) {
+    var relayId = req.params.id;
+    var session = relaySessions[relayId];
+
+    if (!session) {
+        res.status(404).json({ error: 'Relay session not found' });
+        return;
+    }
+
+    if (session.status !== 'receiving') {
+        res.status(400).json({ error: 'Session not in receiving state' });
+        return;
+    }
+
+    var chunk = req.body;
+    session.writeStream.write(chunk);
+    session.receivedBytes += chunk.length;
+
+    // Update active downloads
+    if (activeDownloads[relayId]) {
+        activeDownloads[relayId].downloadedBytes = session.receivedBytes;
+        if (session.totalSize > 0) {
+            activeDownloads[relayId].progress = Math.round((session.receivedBytes / session.totalSize) * 100);
+        }
+        var elapsed = (Date.now() - session.startTime) / 1000;
+        if (elapsed > 0) {
+            activeDownloads[relayId].speed = session.receivedBytes / elapsed;
+            if (session.totalSize > 0 && activeDownloads[relayId].speed > 0) {
+                activeDownloads[relayId].eta = Math.round((session.totalSize - session.receivedBytes) / activeDownloads[relayId].speed);
+            }
+        }
+    }
+
+    res.json({
+        received: session.receivedBytes,
+        total: session.totalSize,
+        progress: session.totalSize > 0 ? Math.round((session.receivedBytes / session.totalSize) * 100) : 0
+    });
+});
+
+// Complete relay — close file, extract
+app.post('/relay-complete/:id', function (req, res) {
+    var relayId = req.params.id;
+    var session = relaySessions[relayId];
+
+    if (!session) {
+        res.status(404).json({ error: 'Relay session not found' });
+        return;
+    }
+
+    session.writeStream.end();
+    session.status = 'extracting';
+
+    if (activeDownloads[relayId]) {
+        activeDownloads[relayId].status = 'extracting';
+        activeDownloads[relayId].progress = 100;
+    }
+
+    console.log('Relay upload complete:', relayId, 'Size:', session.receivedBytes);
+
+    // Extract in background
+    extractRar(session.filePath, session.extractDir, relayId)
+        .then(function () {
+            return listVideoFiles(session.extractDir, relayId);
+        })
+        .then(function (files) {
+            session.status = 'completed';
+            session.files = files;
+            if (activeDownloads[relayId]) {
+                activeDownloads[relayId].status = 'completed';
+                activeDownloads[relayId].files = files;
+            }
+            console.log('Relay extraction done:', relayId, 'Files:', files.length);
+            try { fs.unlinkSync(session.filePath); } catch (e) { }
+        })
+        .catch(function (err) {
+            session.status = 'error';
+            session.error = err.message;
+            if (activeDownloads[relayId]) {
+                activeDownloads[relayId].status = 'error';
+                activeDownloads[relayId].error = err.message;
+            }
+            console.error('Relay extraction failed:', relayId, err.message);
+        });
+
+    res.json({ status: 'extracting', message: 'Upload complete. Extracting...' });
+});
+
 // ===== STREAM REMOTE URL =====
 
 app.get('/stream', async function (req, res) {
