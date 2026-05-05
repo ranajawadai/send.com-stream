@@ -7,122 +7,88 @@ const app = express();
 app.use(cors());
 app.use(compression());
 
-// Landing page
+var BROWSER_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Referer': 'https://send.now/',
+    'Origin': 'https://send.now'
+};
+
 app.get('/', function (req, res) {
-    res.send(`
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Send.now Proxy Server</title>
-        <style>
-            * { margin: 0; padding: 0; box-sizing: border-box; }
-            body {
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                background: #0a0a0a;
-                color: #fff;
-                min-height: 100vh;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-            }
-            .container {
-                text-align: center;
-                max-width: 600px;
-                padding: 40px;
-            }
-            h1 {
-                font-size: 2.5rem;
-                margin-bottom: 16px;
-                background: linear-gradient(to right, #6366f1, #a855f7);
-                -webkit-background-clip: text;
-                -webkit-text-fill-color: transparent;
-            }
-            p {
-                color: #9ca3af;
-                font-size: 1.1rem;
-                margin-bottom: 24px;
-            }
-            .status {
-                display: inline-block;
-                padding: 8px 20px;
-                background: rgba(34, 197, 94, 0.1);
-                border: 1px solid rgba(34, 197, 94, 0.3);
-                border-radius: 9999px;
-                color: #22c55e;
-                font-weight: 600;
-            }
-            .endpoint {
-                margin-top: 32px;
-                padding: 16px;
-                background: rgba(255,255,255,0.05);
-                border-radius: 12px;
-                border: 1px solid rgba(255,255,255,0.1);
-            }
-            code {
-                color: #a78bfa;
-                font-size: 0.95rem;
-            }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Send.now Proxy</h1>
-            <p>High-performance video streaming proxy with HTTP Range Request support.</p>
-            <div class="status">● Server Running</div>
-            <div class="endpoint">
-                <p style="color:#fff; margin-bottom:8px;">API Endpoint:</p>
-                <code>GET /stream?url=VIDEO_URL</code>
-            </div>
-        </div>
-    </body>
-    </html>
-    `);
+    res.send('<html><head><title>Send.now Proxy</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:sans-serif;background:#0a0a0a;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center}.c{text-align:center;max-width:600px;padding:40px}h1{font-size:2.5rem;margin-bottom:16px;background:linear-gradient(to right,#6366f1,#a855f7);-webkit-background-clip:text;-webkit-text-fill-color:transparent}p{color:#9ca3af;font-size:1.1rem;margin-bottom:24px}.s{display:inline-block;padding:8px 20px;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.3);border-radius:9999px;color:#22c55e;font-weight:600}.e{margin-top:32px;padding:16px;background:rgba(255,255,255,.05);border-radius:12px;border:1px solid rgba(255,255,255,.1)}code{color:#a78bfa}</style></head><body><div class="c"><h1>Send.now Proxy</h1><p>Video streaming proxy with Range Request support.</p><div class="s">Server Running</div><div class="e"><p style="color:#fff;margin-bottom:8px">API:</p><code>GET /stream?url=VIDEO_URL</code></div></div></body></html>');
 });
 
-// Health check
 app.get('/health', function (req, res) {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Streaming endpoint
 app.get('/stream', async function (req, res) {
-    const videoUrl = req.query.url;
-    const range = req.headers.range;
+    var videoUrl = req.query.url;
+    var range = req.headers.range;
 
     if (!videoUrl) {
         res.status(400).json({ error: 'url parameter is required' });
         return;
     }
 
+    console.log('Request:', videoUrl, 'Range:', range || 'none');
+
     try {
-        const headResponse = await axios.head(videoUrl);
-        const rawContentLength = headResponse.headers['content-length'];
-        const totalSize = parseInt(String(rawContentLength || '0'), 10);
-        const contentType = String(headResponse.headers['content-type'] || 'video/mp4');
+        // Probe with small range to get total size
+        var probeResp = await axios({
+            method: 'get',
+            url: videoUrl,
+            headers: Object.assign({}, BROWSER_HEADERS, { 'Range': 'bytes=0-0' }),
+            timeout: 30000,
+            maxRedirects: 10,
+            validateStatus: function (s) { return s === 200 || s === 206; }
+        });
+
+        var totalSize = 0;
+        var contentType = String(probeResp.headers['content-type'] || 'video/mp4');
+        var contentRange = probeResp.headers['content-range'];
+        if (contentRange) {
+            var m = contentRange.match(/\/(\d+)/);
+            if (m) totalSize = parseInt(m[1], 10);
+        }
+        if (!totalSize) {
+            totalSize = parseInt(String(probeResp.headers['content-length'] || '0'), 10);
+        }
+
+        console.log('Size:', totalSize, 'Type:', contentType);
 
         if (!range) {
-            const response = await axios({ method: 'get', url: videoUrl, responseType: 'stream' });
+            var resp = await axios({
+                method: 'get',
+                url: videoUrl,
+                responseType: 'stream',
+                headers: BROWSER_HEADERS,
+                timeout: 120000,
+                maxRedirects: 10
+            });
             res.setHeader('Content-Type', contentType);
-            if (rawContentLength) {
-                res.setHeader('Content-Length', String(rawContentLength));
-            }
-            response.data.pipe(res);
+            if (totalSize) res.setHeader('Content-Length', String(totalSize));
+            res.setHeader('Accept-Ranges', 'bytes');
+            resp.data.pipe(res);
             return;
         }
 
-        const parts = range.replace(/bytes=/, "").split("-");
-        const start = parseInt(parts[0], 10);
-        const end = parts[1] ? parseInt(parts[1], 10) : totalSize - 1;
-        const chunksize = (end - start) + 1;
+        var parts = range.replace(/bytes=/, "").split("-");
+        var start = parseInt(parts[0], 10);
+        var end = parts[1] ? parseInt(parts[1], 10) : totalSize - 1;
+        var chunksize = (end - start) + 1;
 
-        const response = await axios({
+        console.log('Range: bytes ' + start + '-' + end + '/' + totalSize);
+
+        var resp = await axios({
             method: 'get',
             url: videoUrl,
             responseType: 'stream',
-            headers: { Range: 'bytes=' + start + '-' + end },
-            timeout: 60000
+            headers: Object.assign({}, BROWSER_HEADERS, { 'Range': 'bytes=' + start + '-' + end }),
+            timeout: 120000,
+            maxRedirects: 10,
+            validateStatus: function (s) { return s === 200 || s === 206; }
         });
 
         res.writeHead(206, {
@@ -130,13 +96,16 @@ app.get('/stream', async function (req, res) {
             'Accept-Ranges': 'bytes',
             'Content-Length': String(chunksize),
             'Content-Type': contentType,
+            'Access-Control-Allow-Origin': '*'
         });
 
-        response.data.pipe(res);
+        resp.data.pipe(res);
+
     } catch (error) {
+        var statusCode = error.response ? error.response.status : 0;
         var message = error.message || 'Unknown error';
-        console.error('Streaming Error:', message);
-        res.status(500).json({ error: 'Stream failed', details: message });
+        console.error('Error:', statusCode, message);
+        res.status(500).json({ error: 'Stream failed', status: statusCode, details: message });
     }
 });
 
