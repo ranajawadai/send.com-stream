@@ -2,28 +2,376 @@ const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
 const compression = require('compression');
+const fs = require('fs');
+const path = require('path');
+const { execSync, exec } = require('child_process');
 
 const app = express();
 app.use(cors());
 app.use(compression());
+app.use(express.json());
+
+const DOWNLOADS_DIR = '/data/downloads';
+const EXTRACTED_DIR = '/data/extracted';
+
+// Ensure directories exist
+fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
+fs.mkdirSync(EXTRACTED_DIR, { recursive: true });
 
 var BROWSER_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Referer': 'https://send.now/',
-    'Origin': 'https://send.now'
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9'
 };
 
+// Store active downloads
+var activeDownloads = {};
+
+// Landing page
 app.get('/', function (req, res) {
-    res.send('<html><head><title>Send.now Proxy</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:sans-serif;background:#0a0a0a;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center}.c{text-align:center;max-width:600px;padding:40px}h1{font-size:2.5rem;margin-bottom:16px;background:linear-gradient(to right,#6366f1,#a855f7);-webkit-background-clip:text;-webkit-text-fill-color:transparent}p{color:#9ca3af;font-size:1.1rem;margin-bottom:24px}.s{display:inline-block;padding:8px 20px;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.3);border-radius:9999px;color:#22c55e;font-weight:600}.e{margin-top:32px;padding:16px;background:rgba(255,255,255,.05);border-radius:12px;border:1px solid rgba(255,255,255,.1)}code{color:#a78bfa}</style></head><body><div class="c"><h1>Send.now Proxy</h1><p>Video streaming proxy with auto-resolve.</p><div class="s">Server Running</div><div class="e"><p style="color:#fff;margin-bottom:8px">Endpoints:</p><code>GET /stream?url=DIRECT_URL</code><br><br><code>GET /resolve?url=SENDNOW_URL</code></div></div></body></html>');
+    res.send('<html><head><title>Send.now Streamer</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:sans-serif;background:#0a0a0a;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center}.c{text-align:center;max-width:700px;padding:40px}h1{font-size:2.5rem;margin-bottom:16px;background:linear-gradient(to right,#6366f1,#a855f7);-webkit-background-clip:text;-webkit-text-fill-color:transparent}p{color:#9ca3af;font-size:1.1rem;margin-bottom:24px}.s{display:inline-block;padding:8px 20px;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.3);border-radius:9999px;color:#22c55e;font-weight:600}.e{margin-top:32px;padding:16px;background:rgba(255,255,255,.05);border-radius:12px;border:1px solid rgba(255,255,255,.1);text-align:left}code{color:#a78bfa;display:block;margin:4px 0}</style></head><body><div class="c"><h1>Send.now Streamer</h1><p>Download RAR files, extract them, and stream videos online.</p><div class="s">Server Running</div><div class="e"><p style="color:#fff;margin-bottom:12px;font-weight:bold">API Endpoints:</p><code>POST /download-extract {url: "DIRECT_RAR_URL"}</code><code>GET /download-status/:id</code><code>GET /files</code><code>GET /stream-file?path=FILE_PATH</code><code>GET /resolve?url=SENDNOW_URL</code><code>GET /stream?url=DIRECT_VIDEO_URL</code><code>DELETE /cleanup</code></div></div></body></html>');
 });
 
 app.get('/health', function (req, res) {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+    res.json({ status: 'ok', timestamp: new Date().toISOString(), activeDownloads: Object.keys(activeDownloads).length });
 });
 
-// Resolve send.now landing page to get direct download link
+// ===== RAR DOWNLOAD AND EXTRACTION =====
+
+// Generate unique download ID
+function generateId() {
+    return 'dl_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+}
+
+// Download and extract RAR file
+app.post('/download-extract', function (req, res) {
+    var rarUrl = req.body.url;
+
+    if (!rarUrl) {
+        res.status(400).json({ error: 'url parameter required in body' });
+        return;
+    }
+
+    var downloadId = generateId();
+    var fileName = decodeURIComponent(rarUrl.split('/').pop().split('?')[0]);
+    var filePath = path.join(DOWNLOADS_DIR, downloadId + '_' + fileName);
+    var extractDir = path.join(EXTRACTED_DIR, downloadId);
+
+    fs.mkdirSync(extractDir, { recursive: true });
+
+    // Initialize download status
+    activeDownloads[downloadId] = {
+        id: downloadId,
+        status: 'downloading',
+        fileName: fileName,
+        progress: 0,
+        downloadedBytes: 0,
+        totalBytes: 0,
+        speed: 0,
+        eta: null,
+        files: [],
+        error: null,
+        startTime: Date.now()
+    };
+
+    console.log('Starting download:', fileName, 'ID:', downloadId);
+
+    // Start download in background
+    downloadFile(rarUrl, filePath, downloadId)
+        .then(function () {
+            return extractRar(filePath, extractDir, downloadId);
+        })
+        .then(function () {
+            return listVideoFiles(extractDir, downloadId);
+        })
+        .then(function (files) {
+            activeDownloads[downloadId].status = 'completed';
+            activeDownloads[downloadId].files = files;
+            activeDownloads[downloadId].progress = 100;
+            console.log('Download completed:', downloadId, 'Files:', files.length);
+
+            // Delete the RAR file to save space
+            try { fs.unlinkSync(filePath); } catch (e) { }
+        })
+        .catch(function (err) {
+            activeDownloads[downloadId].status = 'error';
+            activeDownloads[downloadId].error = err.message;
+            console.error('Download failed:', downloadId, err.message);
+        });
+
+    res.json({
+        downloadId: downloadId,
+        status: 'downloading',
+        message: 'Download started. Check status with GET /download-status/' + downloadId,
+        fileName: fileName
+    });
+});
+
+// Download file with progress tracking
+function downloadFile(url, filePath, downloadId) {
+    return new Promise(function (resolve, reject) {
+        axios({
+            method: 'get',
+            url: url,
+            responseType: 'stream',
+            headers: BROWSER_HEADERS,
+            timeout: 0, // No timeout for large files
+            maxRedirects: 20
+        })
+        .then(function (response) {
+            var totalBytes = parseInt(response.headers['content-length'] || '0', 10);
+            activeDownloads[downloadId].totalBytes = totalBytes;
+
+            var writer = fs.createWriteStream(filePath);
+            var downloadedBytes = 0;
+            var lastTime = Date.now();
+            var lastBytes = 0;
+
+            response.data.on('data', function (chunk) {
+                downloadedBytes += chunk.length;
+                activeDownloads[downloadId].downloadedBytes = downloadedBytes;
+
+                if (totalBytes > 0) {
+                    activeDownloads[downloadId].progress = Math.round((downloadedBytes / totalBytes) * 100);
+                }
+
+                // Calculate speed every second
+                var now = Date.now();
+                if (now - lastTime >= 1000) {
+                    var elapsed = (now - lastTime) / 1000;
+                    var bytesInPeriod = downloadedBytes - lastBytes;
+                    var speed = bytesInPeriod / elapsed; // bytes per second
+                    activeDownloads[downloadId].speed = speed;
+
+                    if (totalBytes > 0 && speed > 0) {
+                        var remaining = totalBytes - downloadedBytes;
+                        activeDownloads[downloadId].eta = Math.round(remaining / speed);
+                    }
+
+                    lastTime = now;
+                    lastBytes = downloadedBytes;
+                }
+            });
+
+            response.data.pipe(writer);
+
+            writer.on('finish', function () {
+                activeDownloads[downloadId].status = 'extracting';
+                activeDownloads[downloadId].progress = 100;
+                resolve();
+            });
+
+            writer.on('error', function (err) {
+                reject(err);
+            });
+        })
+        .catch(function (err) {
+            reject(err);
+        });
+    });
+}
+
+// Extract RAR file
+function extractRar(filePath, extractDir, downloadId) {
+    return new Promise(function (resolve, reject) {
+        activeDownloads[downloadId].status = 'extracting';
+        console.log('Extracting:', filePath);
+
+        try {
+            // Use unrar to extract
+            execSync('unrar x -o+ -y "' + filePath + '" "' + extractDir + '/"', {
+                timeout: 600000, // 10 minutes
+                stdio: 'pipe'
+            });
+            console.log('Extraction completed:', extractDir);
+            resolve();
+        } catch (err) {
+            // Try with 7z as fallback
+            try {
+                execSync('7z x -y -o"' + extractDir + '" "' + filePath + '"', {
+                    timeout: 600000,
+                    stdio: 'pipe'
+                });
+                console.log('Extraction completed with 7z:', extractDir);
+                resolve();
+            } catch (err2) {
+                reject(new Error('Extraction failed: ' + err.message));
+            }
+        }
+    });
+}
+
+// List video files in extracted directory
+function listVideoFiles(dir, downloadId) {
+    var videoExtensions = ['.mp4', '.mkv', '.webm', '.avi', '.mov', '.flv', '.wmv', '.m4v'];
+    var files = [];
+
+    function scanDir(currentDir) {
+        try {
+            var items = fs.readdirSync(currentDir);
+            for (var i = 0; i < items.length; i++) {
+                var item = items[i];
+                var fullPath = path.join(currentDir, item);
+                try {
+                    var stat = fs.statSync(fullPath);
+                    if (stat.isDirectory()) {
+                        scanDir(fullPath);
+                    } else {
+                        var ext = path.extname(item).toLowerCase();
+                        if (videoExtensions.indexOf(ext) !== -1) {
+                            files.push({
+                                name: path.relative(EXTRACTED_DIR, fullPath),
+                                path: fullPath,
+                                size: stat.size,
+                                sizeFormatted: formatBytes(stat.size)
+                            });
+                        }
+                    }
+                } catch (e) { }
+            }
+        } catch (e) { }
+    }
+
+    scanDir(dir);
+
+    // Sort by name
+    files.sort(function (a, b) { return a.name.localeCompare(b.name); });
+
+    return files;
+}
+
+// Get download status
+app.get('/download-status/:id', function (req, res) {
+    var downloadId = req.params.id;
+    var download = activeDownloads[downloadId];
+
+    if (!download) {
+        res.status(404).json({ error: 'Download not found' });
+        return;
+    }
+
+    res.json({
+        id: download.id,
+        status: download.status,
+        fileName: download.fileName,
+        progress: download.progress,
+        downloadedBytes: download.downloadedBytes,
+        downloadedFormatted: formatBytes(download.downloadedBytes),
+        totalBytes: download.totalBytes,
+        totalFormatted: formatBytes(download.totalBytes),
+        speed: download.speed,
+        speedFormatted: formatBytes(download.speed) + '/s',
+        eta: download.eta,
+        files: download.files,
+        error: download.error,
+        elapsed: Math.round((Date.now() - download.startTime) / 1000)
+    });
+});
+
+// List all extracted video files
+app.get('/files', function (req, res) {
+    var allFiles = [];
+
+    try {
+        var dirs = fs.readdirSync(EXTRACTED_DIR);
+        for (var i = 0; i < dirs.length; i++) {
+            var dirPath = path.join(EXTRACTED_DIR, dirs[i]);
+            try {
+                var stat = fs.statSync(dirPath);
+                if (stat.isDirectory()) {
+                    var files = listVideoFiles(dirPath, dirs[i]);
+                    for (var j = 0; j < files.length; j++) {
+                        allFiles.push({
+                            name: files[j].name,
+                            streamUrl: '/stream-file?path=' + encodeURIComponent(files[j].path),
+                            size: files[j].size,
+                            sizeFormatted: files[j].sizeFormatted
+                        });
+                    }
+                }
+            } catch (e) { }
+        }
+    } catch (e) { }
+
+    res.json({ files: allFiles, count: allFiles.length });
+});
+
+// Stream a local file
+app.get('/stream-file', function (req, res) {
+    var filePath = req.query.path;
+    var range = req.headers.range;
+
+    if (!filePath) {
+        res.status(400).json({ error: 'path parameter required' });
+        return;
+    }
+
+    // Security: only allow files from EXTRACTED_DIR
+    if (!filePath.startsWith(EXTRACTED_DIR)) {
+        res.status(403).json({ error: 'Access denied' });
+        return;
+    }
+
+    if (!fs.existsSync(filePath)) {
+        res.status(404).json({ error: 'File not found' });
+        return;
+    }
+
+    var stat = fs.statSync(filePath);
+    var totalSize = stat.size;
+    var ext = path.extname(filePath).toLowerCase();
+    var contentTypeMap = {
+        '.mp4': 'video/mp4',
+        '.mkv': 'video/x-matroska',
+        '.webm': 'video/webm',
+        '.avi': 'video/x-msvideo',
+        '.mov': 'video/quicktime',
+        '.flv': 'video/x-flv',
+        '.wmv': 'video/x-ms-wmv',
+        '.m4v': 'video/mp4'
+    };
+    var contentType = contentTypeMap[ext] || 'application/octet-stream';
+
+    if (!range) {
+        res.writeHead(200, {
+            'Content-Length': totalSize,
+            'Content-Type': contentType,
+            'Accept-Ranges': 'bytes',
+            'Access-Control-Allow-Origin': '*'
+        });
+        fs.createReadStream(filePath).pipe(res);
+        return;
+    }
+
+    var parts = range.replace(/bytes=/, "").split("-");
+    var start = parseInt(parts[0], 10);
+    var end = parts[1] ? parseInt(parts[1], 10) : totalSize - 1;
+    var chunksize = (end - start) + 1;
+
+    res.writeHead(206, {
+        'Content-Range': 'bytes ' + start + '-' + end + '/' + totalSize,
+        'Accept-Ranges': 'bytes',
+        'Content-Length': chunksize,
+        'Content-Type': contentType,
+        'Access-Control-Allow-Origin': '*'
+    });
+
+    fs.createReadStream(filePath, { start: start, end: end }).pipe(res);
+});
+
+// Cleanup all data
+app.delete('/cleanup', function (req, res) {
+    try {
+        execSync('rm -rf ' + DOWNLOADS_DIR + '/* ' + EXTRACTED_DIR + '/*');
+        activeDownloads = {};
+        res.json({ status: 'cleaned', message: 'All downloads and extractions deleted' });
+    } catch (err) {
+        res.status(500).json({ error: 'Cleanup failed', details: err.message });
+    }
+});
+
+// ===== RESOLVE SEND.NOW URL =====
+
 app.get('/resolve', async function (req, res) {
     var sendnowUrl = req.query.url;
 
@@ -32,14 +380,9 @@ app.get('/resolve', async function (req, res) {
         return;
     }
 
-    console.log('Resolving:', sendnowUrl);
-
-    // Extract file ID from URL
     var fileId = sendnowUrl.split('/').pop().split('?')[0];
-    console.log('File ID:', fileId);
 
     try {
-        // Step 1: Fetch the landing page
         var pageResp = await axios({
             method: 'get',
             url: sendnowUrl,
@@ -50,187 +393,60 @@ app.get('/resolve', async function (req, res) {
 
         var html = String(pageResp.data);
 
-        // Step 2: Check if captcha is required
-        if (html.includes('turnstile') || html.includes('Security verification') || html.includes('captcha')) {
-            console.log('Captcha detected for:', fileId);
-
-            // Try to extract file info from the page
-            var fileNameMatch = html.match(/<title>\s*Download\s+(.+?)\s*<\/title>/i);
-            var fileName = fileNameMatch ? fileNameMatch[1].trim() : fileId;
-
-            // Try POST approach with op=download1
-            try {
-                var postResp = await axios({
-                    method: 'post',
-                    url: 'https://send.now',
-                    headers: Object.assign({}, BROWSER_HEADERS, {
-                        'Content-Type': 'application/x-www-form-urlencoded'
-                    }),
-                    data: 'op=download1&id=' + fileId + '&rand=&referer=',
-                    timeout: 30000,
-                    maxRedirects: 10,
-                    validateStatus: function (s) { return s < 500; }
-                });
-
-                var postHtml = String(postResp.data);
-
-                // Check if we got a download page
-                var directLink = extractDownloadLink(postHtml);
-                if (directLink) {
-                    console.log('Direct link found via POST:', directLink);
-                    res.json({
-                        status: 'resolved',
-                        direct_url: directLink,
-                        file_name: fileName,
-                        method: 'post_bypass'
-                    });
-                    return;
-                }
-            } catch (postErr) {
-                console.log('POST approach failed:', postErr.message);
-            }
-
-            // Try API approach
-            try {
-                var apiResp = await axios({
-                    method: 'get',
-                    url: 'https://send.now/api/v1/file/' + fileId,
-                    headers: BROWSER_HEADERS,
-                    timeout: 15000,
-                    maxRedirects: 5,
-                    validateStatus: function (s) { return s < 500; }
-                });
-
-                if (apiResp.data && apiResp.data.download_url) {
-                    console.log('Direct link found via API:', apiResp.data.download_url);
-                    res.json({
-                        status: 'resolved',
-                        direct_url: apiResp.data.download_url,
-                        file_name: fileName,
-                        method: 'api'
-                    });
-                    return;
-                }
-
-                if (apiResp.data && apiResp.data.url) {
-                    console.log('Direct link found via API:', apiResp.data.url);
-                    res.json({
-                        status: 'resolved',
-                        direct_url: apiResp.data.url,
-                        file_name: fileName,
-                        method: 'api'
-                    });
-                    return;
-                }
-            } catch (apiErr) {
-                console.log('API approach failed:', apiErr.message);
-            }
-
-            // All automated approaches failed - return captcha info
+        if (html.includes('turnstile') || html.includes('Security verification')) {
             res.json({
                 status: 'captcha_required',
                 file_id: fileId,
-                file_name: fileName,
-                message: 'Send.now requires captcha verification. Follow these steps:',
-                steps: [
-                    'Step 1: Open this link in your browser: ' + sendnowUrl,
-                    'Step 2: Complete the Cloudflare captcha',
-                    'Step 3: Click "CONTINUE" button',
-                    'Step 4: On the next page, click the Download button',
-                    'Step 5: While downloading, copy the URL from browser address bar or download manager',
-                    'Step 6: Paste that direct URL here to stream it'
-                ]
+                message: 'Captcha required. Open in browser, complete captcha, get direct link from Downloads (Ctrl+J).',
+                open_url: sendnowUrl
             });
             return;
         }
 
-        // No captcha - try to extract direct link from page
         var directLink = extractDownloadLink(html);
         if (directLink) {
-            res.json({
-                status: 'resolved',
-                direct_url: directLink,
-                method: 'direct'
-            });
+            res.json({ status: 'resolved', direct_url: directLink });
             return;
         }
 
-        // Check for download form
-        var formMatch = html.match(/action=["']([^"']+)["']/i);
-        if (formMatch) {
-            res.json({
-                status: 'form_found',
-                form_action: formMatch[1],
-                message: 'Found download form. May need manual interaction.'
-            });
-            return;
-        }
-
-        res.json({
-            status: 'not_found',
-            message: 'Could not find download link on the page.',
-            html_preview: html.substring(0, 1000)
-        });
+        res.json({ status: 'not_found', message: 'Could not find download link.' });
 
     } catch (error) {
-        var statusCode = error.response ? error.response.status : 0;
-        console.error('Resolve error:', statusCode, error.message);
-
-        // If Cloudflare blocked us (403) or any error, return captcha instructions
         res.json({
             status: 'captcha_required',
             file_id: fileId,
-            file_name: fileId,
-            message: 'Send.now uses Cloudflare protection. Automated resolution is not possible. Please follow these steps to get the direct link:',
-            steps: [
-                'Step 1: Open the send.now link in your browser',
-                'Step 2: Complete the Cloudflare captcha verification',
-                'Step 3: Click the "CONTINUE" button',
-                'Step 4: On the next page, click the Download button',
-                'Step 5: While the file starts downloading, open your browser Downloads page (Ctrl+J)',
-                'Step 6: Right-click the downloading file → Copy link address',
-                'Step 7: Paste that direct link here to stream it'
-            ]
+            message: 'Cloudflare blocked. Open in browser, complete captcha, get direct link from Downloads (Ctrl+J).',
+            open_url: sendnowUrl
         });
     }
 });
 
 function extractDownloadLink(html) {
-    // Try various patterns to find direct download links
     var patterns = [
         /href=["'](https?:\/\/[^"']*\.mp4[^"']*?)["']/i,
         /href=["'](https?:\/\/[^"']*\.mkv[^"']*?)["']/i,
-        /href=["'](https?:\/\/[^"']*\.webm[^"']*?)["']/i,
-        /href=["'](https?:\/\/[^"']*\.avi[^"']*?)["']/i,
         /["'](https?:\/\/[^"']*cdn[^"']*\/[^"']*?)["']/i,
         /["'](https?:\/\/[^"']*download[^"']*?)["']/i,
-        /window\.location\.href\s*=\s*["'](https?:\/\/[^"']+)["']/i,
-        /window\.open\(["'](https?:\/\/[^"']+)["']/i,
-        /data-url=["'](https?:\/\/[^"']+)["']/i,
-        /src=["'](https?:\/\/[^"']*\.mp4[^"']*?)["']/i
+        /window\.location\.href\s*=\s*["'](https?:\/\/[^"']+)["']/i
     ];
 
     for (var i = 0; i < patterns.length; i++) {
         var match = html.match(patterns[i]);
-        if (match && match[1]) {
-            return match[1];
-        }
+        if (match && match[1]) return match[1];
     }
-
     return null;
 }
 
-// Streaming endpoint
+// ===== STREAM REMOTE URL =====
+
 app.get('/stream', async function (req, res) {
     var videoUrl = req.query.url;
     var range = req.headers.range;
 
     if (!videoUrl) {
-        res.status(400).json({ error: 'url parameter is required' });
+        res.status(400).json({ error: 'url parameter required' });
         return;
     }
-
-    console.log('Stream request:', videoUrl, 'Range:', range || 'none');
 
     try {
         var probeResp = await axios({
@@ -253,8 +469,6 @@ app.get('/stream', async function (req, res) {
             totalSize = parseInt(String(probeResp.headers['content-length'] || '0'), 10);
         }
 
-        console.log('Size:', totalSize, 'Type:', contentType);
-
         if (!range) {
             var resp = await axios({
                 method: 'get',
@@ -275,8 +489,6 @@ app.get('/stream', async function (req, res) {
         var start = parseInt(parts[0], 10);
         var end = parts[1] ? parseInt(parts[1], 10) : totalSize - 1;
         var chunksize = (end - start) + 1;
-
-        console.log('Range: bytes ' + start + '-' + end + '/' + totalSize);
 
         var resp = await axios({
             method: 'get',
@@ -300,13 +512,25 @@ app.get('/stream', async function (req, res) {
 
     } catch (error) {
         var statusCode = error.response ? error.response.status : 0;
-        var message = error.message || 'Unknown error';
-        console.error('Stream error:', statusCode, message);
-        res.status(500).json({ error: 'Stream failed', status: statusCode, details: message });
+        res.status(500).json({ error: 'Stream failed', status: statusCode });
     }
 });
 
+// ===== HELPER =====
+
+function formatBytes(bytes) {
+    if (!bytes || bytes === 0) return '0 B';
+    var k = 1024;
+    var sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    var i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+// ===== START SERVER =====
+
 var PORT = process.env.PORT || 7860;
 app.listen(PORT, function () {
-    console.log('Proxy running on port ' + PORT);
+    console.log('Send.now Streamer running on port ' + PORT);
+    console.log('Downloads dir:', DOWNLOADS_DIR);
+    console.log('Extracted dir:', EXTRACTED_DIR);
 });
