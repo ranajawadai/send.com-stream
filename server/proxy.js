@@ -175,10 +175,22 @@ app.get('/resolve', async function (req, res) {
     } catch (error) {
         var statusCode = error.response ? error.response.status : 0;
         console.error('Resolve error:', statusCode, error.message);
-        res.status(500).json({
-            error: 'Failed to resolve',
-            status: statusCode,
-            details: error.message
+
+        // If Cloudflare blocked us (403) or any error, return captcha instructions
+        res.json({
+            status: 'captcha_required',
+            file_id: fileId,
+            file_name: fileId,
+            message: 'Send.now uses Cloudflare protection. Automated resolution is not possible. Please follow these steps to get the direct link:',
+            steps: [
+                'Step 1: Open the send.now link in your browser',
+                'Step 2: Complete the Cloudflare captcha verification',
+                'Step 3: Click the "CONTINUE" button',
+                'Step 4: On the next page, click the Download button',
+                'Step 5: While the file starts downloading, open your browser Downloads page (Ctrl+J)',
+                'Step 6: Right-click the downloading file → Copy link address',
+                'Step 7: Paste that direct link here to stream it'
+            ]
         });
     }
 });
