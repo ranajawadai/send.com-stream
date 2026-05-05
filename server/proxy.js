@@ -1,14 +1,14 @@
-import express, { Request, Response } from 'express';
-import axios from 'axios';
-import cors from 'cors';
-import compression from 'compression';
+const express = require('express');
+const axios = require('axios');
+const cors = require('cors');
+const compression = require('compression');
 
 const app = express();
 app.use(cors());
 app.use(compression());
 
-app.get('/stream', async (req: Request, res: Response) => {
-    const videoUrl = req.query.url as string;
+app.get('/stream', async (req, res) => {
+    const videoUrl = req.query.url;
     const range = req.headers.range;
 
     if (!videoUrl) {
@@ -41,20 +41,19 @@ app.get('/stream', async (req: Request, res: Response) => {
             method: 'get',
             url: videoUrl,
             responseType: 'stream',
-            headers: { Range: `bytes=${start}-${end}` },
+            headers: { Range: 'bytes=' + start + '-' + end },
             timeout: 60000
         });
 
-        const headers: Record<string, string> = {
-            'Content-Range': `bytes ${start}-${end}/${totalSize}`,
+        res.writeHead(206, {
+            'Content-Range': 'bytes ' + start + '-' + end + '/' + totalSize,
             'Accept-Ranges': 'bytes',
             'Content-Length': String(chunksize),
             'Content-Type': contentType,
-        };
+        });
 
-        res.writeHead(206, headers);
         response.data.pipe(res);
-    } catch (error: unknown) {
+    } catch (error) {
         const message = error instanceof Error ? error.message : 'Unknown error';
         console.error('Streaming Error:', message);
         res.status(500).send('Stream failed');
@@ -62,6 +61,6 @@ app.get('/stream', async (req: Request, res: Response) => {
 });
 
 const PORT = process.env.PORT || 7860;
-app.listen(PORT, () => {
-    console.log(`Proxy running on port ${PORT}`);
+app.listen(PORT, function () {
+    console.log('Proxy running on port ' + PORT);
 });

@@ -1,23 +1,13 @@
 FROM node:20-slim
 
-# Create app directory
 WORKDIR /app
 
-# Copy package files
-COPY package*.json ./
+COPY proxy-package.json package.json
+RUN npm install --production
 
-# Install dependencies
-RUN npm install
+COPY server/proxy.js ./server/proxy.js
 
-# Copy the rest of the code
-COPY . .
-
-# Build TypeScript (if using ts-node, we can run directly)
-RUN npm install -g ts-node typescript
-
-# Hugging Face Spaces usually expects port 7860
 ENV PORT=7860
 EXPOSE 7860
 
-# Start the server
-CMD ["ts-node", "server/proxy.ts"]
+CMD ["node", "server/proxy.js"]

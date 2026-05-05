@@ -1,3 +1,14 @@
+---
+title: Send.now Video Streamer
+emoji: 🎬
+colorFrom: indigo
+colorTo: purple
+sdk: docker
+sdk_version: "1.0"
+app_file: server/proxy.ts
+pinned: false
+---
+
 # Send.now Video Streamer
 
 A **zero‑cost**, production‑ready solution that lets you stream GB‑size videos hosted on **send.now** directly in the browser – just like YouTube, without downloading the whole file.
