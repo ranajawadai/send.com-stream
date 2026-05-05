@@ -107,66 +107,52 @@ app.post('/download-extract', function (req, res) {
     });
 });
 
-// Download file with progress tracking
+// Download file using wget (better for file hosting sites)
 function downloadFile(url, filePath, downloadId) {
     return new Promise(function (resolve, reject) {
-        axios({
-            method: 'get',
-            url: url,
-            responseType: 'stream',
-            headers: BROWSER_HEADERS,
-            timeout: 0, // No timeout for large files
-            maxRedirects: 20
-        })
-        .then(function (response) {
-            var totalBytes = parseInt(response.headers['content-length'] || '0', 10);
-            activeDownloads[downloadId].totalBytes = totalBytes;
+        console.log('Starting wget download:', url);
 
-            var writer = fs.createWriteStream(filePath);
-            var downloadedBytes = 0;
-            var lastTime = Date.now();
-            var lastBytes = 0;
+        var wgetCmd = 'wget --no-check-certificate --tries=3 --timeout=60 --continue ' +
+            '--user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36" ' +
+            '--header="Accept: */*" ' +
+            '--header="Accept-Language: en-US,en;q=0.9" ' +
+            '--header="Referer: https://send.now/" ' +
+            '-O "' + filePath + '" ' +
+            '"' + url + '"';
 
-            response.data.on('data', function (chunk) {
-                downloadedBytes += chunk.length;
-                activeDownloads[downloadId].downloadedBytes = downloadedBytes;
-
-                if (totalBytes > 0) {
-                    activeDownloads[downloadId].progress = Math.round((downloadedBytes / totalBytes) * 100);
-                }
-
-                // Calculate speed every second
-                var now = Date.now();
-                if (now - lastTime >= 1000) {
-                    var elapsed = (now - lastTime) / 1000;
-                    var bytesInPeriod = downloadedBytes - lastBytes;
-                    var speed = bytesInPeriod / elapsed; // bytes per second
-                    activeDownloads[downloadId].speed = speed;
-
-                    if (totalBytes > 0 && speed > 0) {
-                        var remaining = totalBytes - downloadedBytes;
-                        activeDownloads[downloadId].eta = Math.round(remaining / speed);
-                    }
-
-                    lastTime = now;
-                    lastBytes = downloadedBytes;
-                }
-            });
-
-            response.data.pipe(writer);
-
-            writer.on('finish', function () {
+        var wgetProcess = exec(wgetCmd, { timeout: 0, maxBuffer: 1024 * 1024 }, function (err, stdout, stderr) {
+            if (err) {
+                reject(new Error('wget failed: ' + (stderr || err.message)));
+            } else {
                 activeDownloads[downloadId].status = 'extracting';
                 activeDownloads[downloadId].progress = 100;
                 resolve();
-            });
+            }
+        });
 
-            writer.on('error', function (err) {
-                reject(err);
-            });
-        })
-        .catch(function (err) {
-            reject(err);
+        // Track progress by watching file size
+        var progressInterval = setInterval(function () {
+            try {
+                if (fs.existsSync(filePath)) {
+                    var stat = fs.statSync(filePath);
+                    var downloadedBytes = stat.size;
+                    activeDownloads[downloadId].downloadedBytes = downloadedBytes;
+
+                    if (activeDownloads[downloadId].totalBytes > 0) {
+                        activeDownloads[downloadId].progress = Math.round((downloadedBytes / activeDownloads[downloadId].totalBytes) * 100);
+                    }
+
+                    var now = Date.now();
+                    var elapsed = (now - activeDownloads[downloadId].startTime) / 1000;
+                    if (elapsed > 0) {
+                        activeDownloads[downloadId].speed = downloadedBytes / elapsed;
+                    }
+                }
+            } catch (e) { }
+        }, 2000);
+
+        wgetProcess.on('close', function () {
+            clearInterval(progressInterval);
         });
     });
 }
